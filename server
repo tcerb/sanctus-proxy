@@ -1,0 +1,313 @@
+/**
+ * Sanctus — MassTimes API Proxy Server
+ * Node.js / Express backend
+ */
+
+const express = require('express');
+const cors    = require('cors');
+const https   = require('https');
+const http    = require('http');
+
+const app  = express();
+const PORT = process.env.PORT || 3001;
+app.use(cors({ origin: process.env.ALLOWED_ORIGIN || '*', methods: ['GET'] }));
+
+const MASSTIMES_KEY  = process.env.MASSTIMES_API_KEY || '74e45c40-7f11-11e1-b0c4-0800200c9a66';
+const MASSTIMES_HOST = 'apiv4.updateparishdata.org';
+
+// ── HTTP helper ───────────────────────────────────────────────────────────────
+function fetchUrl(urlStr, timeoutMs = 8000) {
+  return new Promise((resolve, reject) => {
+    try {
+      const parsed  = new URL(urlStr);
+      const lib     = parsed.protocol === 'https:' ? https : http;
+      const options = {
+        hostname: parsed.hostname,
+        path:     parsed.pathname + parsed.search,
+        method:   'GET',
+        headers: {
+          'Accept':          'text/html,application/json',
+          'User-Agent':      'SanctusApp/1.0 (contact@sanctusapp.com)',
+          'Accept-Language': 'en-US,en;q=0.9',
+        },
+        timeout: timeoutMs,
+      };
+      const req = lib.request(options, res => {
+        if ([301,302,303,307,308].includes(res.statusCode) && res.headers.location) {
+          return fetchUrl(new URL(res.headers.location, urlStr).href, timeoutMs)
+            .then(resolve).catch(reject);
+        }
+        let data = '';
+        res.on('data', c => data += c);
+        res.on('end', () => resolve({ status: res.statusCode, body: data }));
+      });
+      req.on('error',   reject);
+      req.on('timeout', () => { req.destroy(); reject(new Error('Timeout')); });
+      req.end();
+    } catch (e) { reject(e); }
+  });
+}
+
+function fetchJSON(path) {
+  return fetchUrl(`https://${MASSTIMES_HOST}${path}`).then(r => JSON.parse(r.body));
+}
+
+// ── MassTimes ─────────────────────────────────────────────────────────────────
+app.get('/api/churches', async (req, res) => {
+  const { lat, lng } = req.query;
+  if (!lat || !lng) return res.status(400).json({ error: 'lat and lng required' });
+  try {
+    const data = await fetchJSON(`/Churchs/?lat=${parseFloat(lat)}&long=${parseFloat(lng)}&apikey=${MASSTIMES_KEY}`);
+    res.json(data);
+  } catch (err) {
+    res.status(502).json({ error: 'MassTimes fetch failed', detail: err.message });
+  }
+});
+
+app.get('/api/churches/:id', async (req, res) => {
+  try {
+    const data = await fetchJSON(`/Churchs/${req.params.id}?apikey=${MASSTIMES_KEY}`);
+    res.json(data);
+  } catch (err) {
+    res.status(502).json({ error: 'MassTimes fetch failed', detail: err.message });
+  }
+});
+
+// ── Geocode ───────────────────────────────────────────────────────────────────
+app.get('/api/geocode', async (req, res) => {
+  const { q } = req.query;
+  if (!q) return res.status(400).json({ error: 'q required' });
+  try {
+    const r = await fetchUrl(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q)}&format=json&limit=1`);
+    res.json(JSON.parse(r.body));
+  } catch (err) {
+    res.status(502).json({ error: 'Geocode failed', detail: err.message });
+  }
+});
+
+// ── Parish info scraper ───────────────────────────────────────────────────────
+/**
+ * GET /api/parish-info?url=https://stpatrickdc.org
+ *
+ * Extracts:
+ *  - clergy names + titles
+ *  - recent improvements/news (past ~12 months) from homepage/news/blog pages
+ *  - social media links (Facebook, Instagram, YouTube, Twitter/X)
+ *  - OG hero image
+ */
+
+const CLERGY_TITLES = [
+  'Pastor','Parochial Administrator','Administrator','Rector',
+  'Parochial Vicar','Associate Pastor','In Residence','Deacon','Permanent Deacon',
+];
+const NAME_PREFIXES = ['Fr\\.','Father','Rev\\.','Reverend','Msgr\\.','Monsignor',
+                       'Sr\\.','Sister','Dcn\\.','Deacon','Bishop','Cardinal'];
+
+function extractClergy(html) {
+  const clergy = [], seen = new Set();
+  const titlePatterns = CLERGY_TITLES.map(t =>
+    new RegExp(`${t}[:\\s\\-–—]+([A-Z][a-z]+(?:\\s+[A-Z][a-zA-Z\\.]+){1,4})`, 'gi')
+  );
+  for (const re of titlePatterns) {
+    let m;
+    while ((m = re.exec(html)) !== null) {
+      const name = m[1].trim().replace(/\s+/g,' ');
+      if (!seen.has(name) && name.length > 4 && name.length < 60) {
+        const title = CLERGY_TITLES.find(t => re.source.startsWith(t)) || 'Clergy';
+        clergy.push({ name, title }); seen.add(name);
+      }
+    }
+  }
+  const prefixRe = new RegExp(`(?:${NAME_PREFIXES.join('|')})\\s+([A-Z][a-z]+(?:\\s+[A-Z][a-zA-Z\\.]+){0,4})`,'gi');
+  let m2;
+  while ((m2 = prefixRe.exec(html)) !== null) {
+    const raw = m2[0].trim().replace(/\s+/g,' ');
+    if (!seen.has(raw) && raw.length > 5 && raw.length < 70) {
+      const ctx = html.substring(Math.max(0,m2.index-100), m2.index+raw.length+100);
+      const foundTitle = CLERGY_TITLES.find(t => new RegExp(t,'i').test(ctx));
+      clergy.push({ name: raw, title: foundTitle || 'Clergy' }); seen.add(raw);
+    }
+  }
+  return clergy.slice(0, 6);
+}
+
+function extractOgImage(html, baseUrl) {
+  const m = html.match(/<meta[^>]+(?:property=["']og:image["']|name=["']og:image["'])[^>]+content=["']([^"']+)["']/i)
+         || html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+(?:property=["']og:image["'])/i);
+  if (!m) return null;
+  let src = m[1];
+  if (src.startsWith('//'))  src = 'https:' + src;
+  if (src.startsWith('/'))   src = new URL(baseUrl).origin + src;
+  return src;
+}
+
+function extractSocialLinks(html, baseUrl) {
+  const socials = {};
+  const patterns = {
+    facebook:  /https?:\/\/(?:www\.)?facebook\.com\/(?!sharer|share|dialog|pages\/category)[a-zA-Z0-9._\-\/]+/gi,
+    instagram: /https?:\/\/(?:www\.)?instagram\.com\/[a-zA-Z0-9._]+/gi,
+    youtube:   /https?:\/\/(?:www\.)?youtube\.com\/(?:channel|c|user|@)[a-zA-Z0-9._\-]+/gi,
+    twitter:   /https?:\/\/(?:www\.)?(?:twitter|x)\.com\/[a-zA-Z0-9_]+/gi,
+  };
+  for (const [platform, re] of Object.entries(patterns)) {
+    const match = html.match(re);
+    if (match) {
+      // Take the first match, clean it up
+      const url = match[0].replace(/['">\s].*$/, '');
+      if (url.length < 120) socials[platform] = url;
+    }
+  }
+  return socials;
+}
+
+// Extract recent improvements/news — look for dated content within past 12 months
+function extractRecentImprovements(text) {
+  const improvements = [];
+  const seen = new Set();
+  const now = new Date();
+  const cutoff = new Date(now.getFullYear() - 1, now.getMonth(), 1); // 12 months ago
+
+  // Month names for parsing
+  const MONTHS = ['january','february','march','april','may','june',
+                  'july','august','september','october','november','december'];
+  const MONTH_ABBR = ['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'];
+
+  // Keywords that suggest improvements/news (not mass times)
+  const IMPROVEMENT_KEYWORDS = [
+    'renovation','restoration','improvement','completed','installed','upgraded','new',
+    'repaired','replaced','dedicated','blessed','opened','expanded','construction',
+    'project','campaign','initiative','program','ministry','community','event',
+    'fundraiser','donation','gift','awarded','received','announced','launched',
+  ];
+
+  // Try to find sentences with dates + improvement keywords
+  // Pattern: "Month Year — sentence" or "Month Day, Year"
+  const datePatterns = [
+    // "March 2025" or "March 15, 2025"
+    new RegExp(`((?:${MONTHS.join('|')}|${MONTH_ABBR.join('|')})\\s+(?:\\d{1,2},?\\s+)?(?:202[3-9]))\\s*[:\\-–—]?\\s*([^.!?]{20,180}[.!?])`, 'gi'),
+    // "2024" or "2025" near improvement keywords
+    new RegExp(`(202[3-9])\\s*[:\\-–—]?\\s*([^.!?]{20,180}[.!?])`, 'gi'),
+  ];
+
+  for (const re of datePatterns) {
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      const dateStr = m[1].trim();
+      const sentence = m[2].trim().replace(/\s+/g,' ');
+
+      // Parse year
+      const yearMatch = dateStr.match(/202[3-9]/);
+      if (!yearMatch) continue;
+      const year = parseInt(yearMatch[0]);
+
+      // Parse month if present
+      let month = -1;
+      for (let mi = 0; mi < MONTHS.length; mi++) {
+        if (dateStr.toLowerCase().includes(MONTHS[mi]) || dateStr.toLowerCase().includes(MONTH_ABBR[mi])) {
+          month = mi; break;
+        }
+      }
+
+      // Check date is within past 12 months
+      const entryDate = new Date(year, month >= 0 ? month : 0, 1);
+      if (entryDate < cutoff) continue;
+
+      // Check sentence contains improvement keywords
+      const sentLower = sentence.toLowerCase();
+      const hasKeyword = IMPROVEMENT_KEYWORDS.some(k => sentLower.includes(k));
+      if (!hasKeyword) continue;
+
+      // Deduplicate by first 40 chars
+      const key = sentence.slice(0, 40);
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      // Format date label
+      const monthName = month >= 0
+        ? MONTHS[month].charAt(0).toUpperCase() + MONTHS[month].slice(1, 3) + ' ' + year
+        : String(year);
+
+      improvements.push({ date: monthName, text: sentence });
+      if (improvements.length >= 4) break;
+    }
+    if (improvements.length >= 4) break;
+  }
+
+  return improvements;
+}
+
+const SUBPAGES = ['/news','/updates','/blog','/announcements','/about','/staff','/clergy',
+                  '/our-pastor','/parish-staff','/about-us','/pastoral-staff','/parish-life'];
+
+app.get('/api/parish-info', async (req, res) => {
+  let { url } = req.query;
+  if (!url) return res.status(400).json({ error: 'url required' });
+  if (!url.startsWith('http')) url = 'https://' + url;
+
+  const result = { clergy: [], ogImage: null, improvements: [], socials: {}, source: 'none' };
+
+  try {
+    const home = await fetchUrl(url, 7000);
+    result.ogImage = extractOgImage(home.body, url);
+    result.socials = extractSocialLinks(home.body, url);
+
+    const homeText = home.body
+      .replace(/<script[\s\S]*?<\/script>/gi, '')
+      .replace(/<style[\s\S]*?<\/style>/gi, '')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/&amp;/g,'&').replace(/&#\d+;/g,' ').replace(/&[a-z]+;/g,' ')
+      .replace(/\s+/g,' ');
+
+    result.clergy = extractClergy(homeText);
+    result.improvements = extractRecentImprovements(homeText);
+    result.source = 'homepage';
+
+    // Try subpages for more clergy / improvements / socials
+    if (result.clergy.length < 1 || result.improvements.length < 1) {
+      for (const sub of SUBPAGES) {
+        try {
+          const subUrl = new URL(sub, url).href;
+          const subRes = await fetchUrl(subUrl, 5000);
+          if (subRes.status !== 200) continue;
+
+          const subText = subRes.body
+            .replace(/<script[\s\S]*?<\/script>/gi, '')
+            .replace(/<style[\s\S]*?<\/style>/gi, '')
+            .replace(/<[^>]+>/g, ' ')
+            .replace(/\s+/g,' ');
+
+          if (result.clergy.length < 1) {
+            const found = extractClergy(subText);
+            if (found.length > result.clergy.length) {
+              result.clergy = found;
+              result.source = 'subpage:' + sub;
+            }
+          }
+
+          if (result.improvements.length < 1) {
+            const found = extractRecentImprovements(subText);
+            if (found.length > result.improvements.length) {
+              result.improvements = found;
+            }
+          }
+
+          // Merge socials
+          const subSocials = extractSocialLinks(subRes.body, subUrl);
+          result.socials = { ...subSocials, ...result.socials };
+
+          if (!result.ogImage) result.ogImage = extractOgImage(subRes.body, subUrl);
+
+          if (result.clergy.length >= 1 && result.improvements.length >= 1) break;
+        } catch (_) {}
+      }
+    }
+  } catch (err) {
+    return res.status(502).json({ error: 'Scrape failed', detail: err.message });
+  }
+
+  res.json(result);
+});
+
+app.get('/health', (_req, res) => res.json({ status: 'ok', service: 'sanctus-proxy' }));
+app.listen(PORT, () => console.log(`Sanctus proxy running on port ${PORT}`));
+module.exports = app;
